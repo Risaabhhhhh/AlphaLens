@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 import certifi
 import urllib3
 urllib3.disable_warnings()
+
 # load environment variables
 load_dotenv()
 
