@@ -1,0 +1,17 @@
+news:
+  lookback_days: 1
+  max_articles: 100
+
+signals:
+  bullish_threshold: 0.6
+  bearish_threshold: -0.6
+
+model:
+  price_move_threshold: 0.02
+
+watchlist:
+  - AAPL
+  - NVDA
+  - TSLA
+  - MSFT
+  - AMZN
