@@ -16,3 +16,8 @@ uvicorn
 yfinance
 
 plotly
+scikit-learn
+xgboost
+joblib
+loguru
+sqlalchemyw
