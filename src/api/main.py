@@ -1,373 +1,424 @@
-import os
-import json
-import glob
-import joblib
+"""
+main.py — AlphaLens FastAPI Backend
+Reads from your CSV files + model. No database needed.
+
+Endpoints:
+  GET  /health
+  GET  /signals          — top signals from labeled_dataset.csv
+  GET  /news             — raw news from data/raw/*.json
+  GET  /summary          — dashboard stats
+  GET  /company/{ticker} — per-ticker breakdown
+  POST /analyze          — analyze any headline live
+  GET  /top              — top signals ranked by probability
+  GET  /watchlist        — signals for watchlist tickers only
+"""
+
+import os, json, glob, joblib, math
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# ── App setup ─────────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="AlphaLens API",
-    description="Financial News Alpha Detection System",
-    version="1.0.0",
-)
-
+app = FastAPI(title="AlphaLens API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Path constants (matching YOUR repo structure) ─────────────────────────────
-BASE_DIR        = Path(__file__).parent.parent.parent
-DATA_DIR        = BASE_DIR / "data"
-RAW_DIR         = DATA_DIR / "raw"
-PROCESSED_DIR   = DATA_DIR / "processed"
-MODEL_DIR       = DATA_DIR / "models"
-
-LABELED_CSV     = PROCESSED_DIR / "labeled_dataset.csv"
-FEATURES_CSV    = PROCESSED_DIR / "news_features.csv"
-MODEL_PKL       = MODEL_DIR / "impact_model.pkl"
-
-
-# ── Data loaders (cached in memory) ──────────────────────────────────────────
-_cache = {}
-
-def load_labeled() -> pd.DataFrame:
-    if "labeled" not in _cache or _stale("labeled"):
-        if LABELED_CSV.exists():
-            df = pd.read_csv(LABELED_CSV)
-            df.columns = [c.strip().lower() for c in df.columns]
-            _cache["labeled"] = df
-            _cache["labeled_ts"] = datetime.now()
-        else:
-            return pd.DataFrame()
-    return _cache["labeled"]
-
-
-def load_features() -> pd.DataFrame:
-    if "features" not in _cache or _stale("features"):
-        if FEATURES_CSV.exists():
-            df = pd.read_csv(FEATURES_CSV)
-            df.columns = [c.strip().lower() for c in df.columns]
-            _cache["features"] = df
-            _cache["features_ts"] = datetime.now()
-        else:
-            return pd.DataFrame()
-    return _cache["features"]
-
-
-def load_raw_news() -> list[dict]:
-    """Load all raw JSON files from data/raw/"""
-    articles = []
-    for path in sorted(RAW_DIR.glob("news_*.json"), reverse=True)[:10]:
-        try:
-            with open(path) as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    articles.extend(data)
-                elif isinstance(data, dict):
-                    articles.append(data)
-        except Exception:
-            pass
-    return articles
-
-
-def load_model():
-    if "model" not in _cache:
-        if MODEL_PKL.exists():
-            _cache["model"] = joblib.load(MODEL_PKL)
-        else:
+def clean(obj):
+    """Recursively replace NaN/Inf with None so JSON serialization never fails."""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
             return None
-    return _cache["model"]
+        return obj
+    if isinstance(obj, dict):
+        return {k: clean(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [clean(v) for v in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return None if (math.isnan(float(obj)) or math.isinf(float(obj))) else float(obj)
+    if isinstance(obj, np.ndarray):
+        return clean(obj.tolist())
+    return obj
 
+# ── Paths ─────────────────────────────────────────────────────────────────────
+ROOT         = Path(__file__).parent.parent.parent
+LABELED_CSV  = ROOT / "data" / "processed" / "labeled_dataset.csv"
+FEATURES_CSV = ROOT / "data" / "processed" / "news_features.csv"
+MODEL_PKL    = ROOT / "data" / "models"     / "impact_model.pkl"
+META_PKL     = ROOT / "data" / "models"     / "model_meta.pkl"
+RAW_DIR      = ROOT / "data" / "raw"
 
-def _stale(key: str, ttl_seconds: int = 60) -> bool:
-    ts_key = f"{key}_ts"
-    if ts_key not in _cache:
-        return True
-    return (datetime.now() - _cache[ts_key]).seconds > ttl_seconds
+# ── Sentiment + event maps (matches your impact_model.py) ─────────────────────
+SENTIMENT_SCORE_MAP = {
+    "negative": -1.0,  "neutral": 0.0,   "positive": 1.0,
+    "Bearish": -1.0,   "Somewhat-Bearish": -0.5,
+    "Neutral": 0.0,
+    "Somewhat-Bullish": 0.5, "Bullish": 1.0,
+}
+EVENT_MAP = {
+    "earnings": 0, "acquisition": 1, "product_launch": 2,
+    "partnership": 3, "lawsuit": 4, "regulatory": 5,
+    "macro": 6, "general": 7,
+}
+SOURCE_SCORES = {
+    "reuters": 1.0, "bloomberg": 1.0, "wsj": 0.95,
+    "cnbc": 0.85, "marketwatch": 0.80, "seekingalpha": 0.70,
+    "benzinga": 0.70, "yahoo": 0.75, "motley fool": 0.65,
+}
+EVENT_KEYWORDS = {
+    "earnings":       ["earnings","revenue","profit","eps","quarterly","beat","miss","guidance"],
+    "acquisition":    ["acqui","merger","takeover","buyout","deal","purchase"],
+    "product_launch": ["launch","unveil","announce","release","new product","debut","introduces"],
+    "partnership":    ["partner","collaborat","agreement","joint venture"],
+    "lawsuit":        ["lawsuit","sue","court","legal","settle","class action"],
+    "regulatory":     ["sec","ftc","regulation","fine","penalty","ban","antitrust"],
+    "macro":          ["fed","inflation","gdp","interest rate","recession","fomc"],
+}
+EVENT_IMPORTANCE = {
+    "earnings":1.0,"acquisition":0.9,"lawsuit":0.8,"regulatory":0.8,
+    "product_launch":0.7,"macro":0.6,"partnership":0.5,"general":0.3,
+}
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def classify_event(text: str) -> tuple[str, float]:
+    t = text.lower()
+    for ev, kws in EVENT_KEYWORDS.items():
+        if any(k in t for k in kws):
+            return ev, EVENT_IMPORTANCE[ev]
+    return "general", 0.3
 
-# ── Signal logic (matches your signal_generator.py) ──────────────────────────
-def compute_signal(prob: float, sentiment: str) -> dict:
-    if prob > 0.65:
-        signal = "Bullish"
-    elif prob < 0.35:
-        signal = "Bearish"
+def source_score(s: str) -> float:
+    if not s: return 0.5
+    s = s.lower()
+    for k, v in SOURCE_SCORES.items():
+        if k in s: return v
+    return 0.5
+
+def sentiment_to_signal(sentiment: str, prob: float) -> str:
+    if prob >= 0.65: return "Bullish"
+    if prob <= 0.35: return "Bearish"
+    return "Neutral"
+
+def explanation_drivers(sentiment: str, event_type: str,
+                        source: str, prob: float) -> list[str]:
+    drivers = []
+    if sentiment in ("positive","Bullish","Somewhat-Bullish"):
+        drivers.append("✓ Positive market sentiment")
+    elif sentiment in ("negative","Bearish","Somewhat-Bearish"):
+        drivers.append("✗ Negative market sentiment")
+    if event_type in ("earnings","acquisition","regulatory","lawsuit"):
+        drivers.append(f"✓ High-impact event: {event_type.replace('_',' ').title()}")
+    elif event_type == "product_launch":
+        drivers.append("✓ Product launch event")
+    sc = source_score(source)
+    if sc >= 0.9:
+        drivers.append("✓ High-credibility source")
+    elif sc <= 0.6:
+        drivers.append("~ Lower-credibility source")
+    if prob >= 0.65:
+        drivers.append(f"→ Model confidence: {prob:.0%} move probability")
+    return drivers or ["~ General news, moderate signal"]
+
+# ── Data cache ────────────────────────────────────────────────────────────────
+_cache: dict = {}
+
+def get_df() -> pd.DataFrame:
+    if "df" not in _cache:
+        if not LABELED_CSV.exists():
+            return pd.DataFrame()
+        df = pd.read_csv(LABELED_CSV)
+        df.columns = [c.strip().lower() for c in df.columns]
+        # Unified sentiment
+        if "sentiment" in df.columns and "av_sentiment" in df.columns:
+            df["_sentiment"] = df["sentiment"].combine_first(df["av_sentiment"])
+        elif "sentiment" in df.columns:
+            df["_sentiment"] = df["sentiment"]
+        elif "av_sentiment" in df.columns:
+            df["_sentiment"] = df["av_sentiment"]
+        else:
+            df["_sentiment"] = "neutral"
+        # Signal
+        if "signal" not in df.columns:
+            if "return_24h" in df.columns:
+                df["signal"] = df.apply(lambda r: "Bullish" if r.get("label",0)==1
+                    and str(r.get("_sentiment","")).lower() in ("positive","bullish","somewhat-bullish")
+                    else ("Bearish" if r.get("label",0)==1 else "Neutral"), axis=1)
+            else:
+                df["signal"] = "Neutral"
+        _cache["df"] = df
+    return _cache["df"]
+
+def get_raw_news() -> list[dict]:
+    if "news" not in _cache:
+        articles = []
+        for p in sorted(RAW_DIR.glob("*.json"), reverse=True)[:20]:
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, list): articles.extend(data)
+            except: pass
+        _cache["news"] = articles
+    return _cache["news"]
+
+def get_model():
+    if "model" not in _cache and MODEL_PKL.exists():
+        _cache["model"] = joblib.load(MODEL_PKL)
+    return _cache.get("model")
+
+def invalidate_cache():
+    _cache.clear()
+
+# ── Live prediction helper ────────────────────────────────────────────────────
+def run_prediction(headline: str, sentiment_label: str,
+                   sentiment_conf: float, source: str = "") -> dict:
+    event_type, importance = classify_event(headline)
+    sent_score = SENTIMENT_SCORE_MAP.get(sentiment_label, 0.0)
+
+    model = get_model()
+    if model is not None:
+        row = pd.DataFrame([{
+            "sentiment_encoded":  {"negative":0,"neutral":1,"positive":2,
+                                   "Bearish":0,"Neutral":1,"Bullish":2,
+                                   "Somewhat-Bearish":0,"Somewhat-Bullish":2
+                                   }.get(sentiment_label, 1),
+            "sentiment_score":    sent_score,
+            "event_encoded":      EVENT_MAP.get(event_type, 7),
+            "confidence":         sentiment_conf,
+            "importance":         importance,
+            "headline_len":       len(headline),
+            "source_score":       source_score(source),
+            "sentiment_x_event":  sent_score * importance,
+        }])
+        try:
+            prob = float(model.predict_proba(row)[0][1])
+        except Exception:
+            prob = abs(sent_score) * 0.6 + importance * 0.3
     else:
-        signal = "Neutral"
-    confidence = abs(prob - 0.5) * 2
-    return {"signal": signal, "confidence": round(confidence, 3)}
+        prob = abs(sent_score) * 0.6 + importance * 0.3
 
+    signal  = sentiment_to_signal(sentiment_label, prob)
+    drivers = explanation_drivers(sentiment_label, event_type, source, prob)
+
+    return {
+        "sentiment":          sentiment_label,
+        "sentiment_score":    round(sent_score, 3),
+        "confidence":         round(sentiment_conf, 3),
+        "event_type":         event_type,
+        "importance":         round(importance, 3),
+        "impact_probability": round(prob, 3),
+        "signal":             signal,
+        "drivers":            drivers,
+    }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {
-        "status": "ok",
-        "model_loaded":    MODEL_PKL.exists(),
-        "labeled_data":    LABELED_CSV.exists(),
-        "features_data":   FEATURES_CSV.exists(),
-        "raw_files":       len(list(RAW_DIR.glob("news_*.json"))) if RAW_DIR.exists() else 0,
+        "status":       "ok",
+        "model":        MODEL_PKL.exists(),
+        "labeled_data": LABELED_CSV.exists(),
+        "raw_files":    len(list(RAW_DIR.glob("*.json"))) if RAW_DIR.exists() else 0,
     }
 
-
-# ── POST /predict — single headline prediction ────────────────────────────────
-class PredictRequest(BaseModel):
+# ── POST /analyze — headline analyzer ────────────────────────────────────────
+class AnalyzeRequest(BaseModel):
     headline: str
-    ticker: Optional[str] = None
-    source: Optional[str] = None
+    ticker:   Optional[str] = None
+    source:   Optional[str] = ""
 
+@app.post("/analyze")
+def analyze(req: AnalyzeRequest):
+    """Live pipeline: headline → FinBERT → XGBoost → signal + explanation."""
+    try:
+        from src.models.sentiment_model import analyze_sentiment
+        sentiment_label, sentiment_conf = analyze_sentiment(req.headline)
+    except Exception:
+        # Fallback if FinBERT not available in API context
+        sentiment_label, sentiment_conf = "neutral", 0.5
 
-@app.post("/predict")
-def predict(req: PredictRequest):
-    """
-    Run the full pipeline on a single headline.
-    Returns: sentiment, event_type, impact_probability, signal
-    """
-    from src.preprocessing.entity_extractor import classify_event
-    from src.models.sentiment_model       import analyze_sentiment
-
-    # Sentiment
-    sentiment_label, sentiment_score = analyze_sentiment(req.headline)
-
-    # Event classification
-    event_type = classify_event(req.headline)
-
-    # Impact probability
-    model = load_model()
-    if model is not None:
-        # Build feature row matching your feature builder output
-        event_map = {"earnings":6,"acquisition":5,"product_launch":4,
-                     "partnership":3,"lawsuit":5,"regulatory":5,"macro":4,"general":1}
-        row = pd.DataFrame([{
-            "sentiment_score":    sentiment_score,
-            "confidence":         abs(sentiment_score),
-            "importance":         event_map.get(event_type, 1) / 6.0,
-            "event_type_encoded": event_map.get(event_type, 1),
-        }])
-        try:
-            # Try predict with available columns
-            prob = float(model.predict_proba(row)[:, 1][0])
-        except Exception:
-            prob = abs(sentiment_score) * 0.7
-    else:
-        prob = abs(sentiment_score) * 0.7
-
-    sig = compute_signal(prob, sentiment_label)
-
+    result = run_prediction(req.headline, sentiment_label,
+                            sentiment_conf, req.source or "")
     return {
-        "headline":           req.headline,
-        "ticker":             req.ticker,
-        "sentiment":          sentiment_label,
-        "sentiment_score":    round(sentiment_score, 4),
-        "event_type":         event_type,
-        "impact_probability": round(prob, 4),
-        "signal":             sig["signal"],
-        "confidence":         sig["confidence"],
+        "headline": req.headline,
+        "ticker":   req.ticker,
+        **result,
     }
 
-
-# ── GET /signals — all signals from labeled dataset ───────────────────────────
+# ── GET /signals ──────────────────────────────────────────────────────────────
 @app.get("/signals")
 def get_signals(
     ticker: Optional[str] = Query(None),
-    signal: Optional[str] = Query(None, description="Bullish | Bearish | Neutral"),
-    limit:  int           = Query(50, le=500),
-):
-    df = load_labeled()
-    if df.empty:
-        return []
-
-    # Compute signal column if not present
-    if "signal" not in df.columns:
-        if "impact_probability" in df.columns:
-            df["signal"] = df["impact_probability"].apply(
-                lambda p: "Bullish" if p > 0.65 else ("Bearish" if p < 0.35 else "Neutral")
-            )
-        elif "label" in df.columns:
-            df["signal"] = df["label"].apply(lambda x: "Bullish" if x == 1 else "Neutral")
-
-    # Normalize column names (your CSV may use slightly different names)
-    col_map = {
-        "return_24h": "price_return_24h",
-        "sentiment_label": "sentiment",
-    }
-    df = df.rename(columns=col_map)
-
-    # Filters
-    if ticker:
-        if "ticker" in df.columns:
-            df = df[df["ticker"].str.upper() == ticker.upper()]
-    if signal:
-        if "signal" in df.columns:
-            df = df[df["signal"].str.lower() == signal.lower()]
-
-    # Sort by most recent if date column exists
-    for date_col in ["published_at", "date", "timestamp"]:
-        if date_col in df.columns:
-            df = df.sort_values(date_col, ascending=False)
-            break
-
-    df = df.head(limit)
-
-    # Fill NaN for JSON serialization
-    df = df.where(pd.notnull(df), None)
-    return df.to_dict(orient="records")
-
-
-# ── GET /news — raw news from your JSON files ─────────────────────────────────
-@app.get("/news")
-def get_news(
-    ticker: Optional[str] = Query(None),
+    signal: Optional[str] = Query(None),
     limit:  int           = Query(50, le=200),
 ):
-    articles = load_raw_news()
+    df = get_df()
+    if df.empty: return []
 
     if ticker:
-        articles = [
-            a for a in articles
-            if ticker.upper() in str(a.get("related", "")).upper()
-            or ticker.upper() in str(a.get("ticker", "")).upper()
-        ]
+        df = df[df.get("ticker", pd.Series()).str.upper() == ticker.upper()]
+    if signal:
+        df = df[df["signal"].str.lower() == signal.lower()]
 
-    articles = articles[:limit]
+    for col in ("published_at", "date"):
+        if col in df.columns:
+            df = df.sort_values(col, ascending=False)
+            break
 
-    # Normalize keys across different Finnhub response shapes
-    normalized = []
-    for a in articles:
-        normalized.append({
-            "headline":     a.get("headline", a.get("title", "")),
-            "summary":      a.get("summary", a.get("description", "")),
-            "source":       a.get("source", ""),
-            "url":          a.get("url", ""),
-            "ticker":       a.get("related", a.get("ticker", "")),
-            "published_at": a.get("datetime", a.get("publishedAt", "")),
-        })
+    out = df.head(limit).where(pd.notnull(df), None)
+    return JSONResponse(content=clean(out.to_dict(orient="records")))
 
-    return normalized
+# ── GET /top — ranked by impact ───────────────────────────────────────────────
+@app.get("/top")
+def get_top(limit: int = Query(10, le=50)):
+    """Top signals ranked by impact probability / label."""
+    df = get_df()
+    if df.empty: return JSONResponse(content=[])
 
+    sort_cols = []
+    if "label"      in df.columns: sort_cols.append("label")
+    if "confidence" in df.columns: sort_cols.append("confidence")
+    if "importance" in df.columns: sort_cols.append("importance")
 
-# ── GET /company/{ticker} — per-ticker breakdown ──────────────────────────────
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=False)
+
+    top = df.head(limit).where(pd.notnull(df), None)
+    records = top.to_dict(orient="records")
+
+    for i, r in enumerate(records):
+        r["rank"] = i + 1
+        conf = r.get("confidence") or r.get("importance") or 0.5
+        try:
+            conf = float(conf) if conf is not None else 0.5
+        except:
+            conf = 0.5
+        r["drivers"] = explanation_drivers(
+            r.get("_sentiment", r.get("sentiment", "neutral")),
+            r.get("event_type", "general"),
+            r.get("source", ""),
+            conf,
+        )
+
+    return JSONResponse(content=clean(records))
+
+# ── GET /news ─────────────────────────────────────────────────────────────────
+@app.get("/news")
+def get_news(limit: int = Query(30, le=100)):
+    articles = get_raw_news()[:limit]
+    return [{
+        "headline":     a.get("headline", a.get("title", "")),
+        "summary":      a.get("summary",  "")[:200],
+        "source":       a.get("source",   ""),
+        "url":          a.get("url",      ""),
+        "ticker":       a.get("related",  a.get("ticker", "")),
+        "published_at": a.get("datetime", ""),
+    } for a in articles if a.get("headline") or a.get("title")]
+
+# ── GET /summary ──────────────────────────────────────────────────────────────
+@app.get("/summary")
+def get_summary():
+    df  = get_df()
+    raw = get_raw_news()
+
+    if df.empty:
+        return {"total":0,"bullish":0,"bearish":0,"neutral":0,
+                "top_signals":[],"model_loaded": MODEL_PKL.exists()}
+
+    bull = int((df["signal"] == "Bullish").sum())
+    bear = int((df["signal"] == "Bearish").sum())
+    neut = int((df["signal"] == "Neutral").sum())
+
+    # Top 3 tickers by signal count
+    top_signals = []
+    if "ticker" in df.columns:
+        for ticker, grp in df.groupby("ticker"):
+            b = int((grp["signal"] == "Bullish").sum())
+            r = int((grp["signal"] == "Bearish").sum())
+            dominant = "Bullish" if b >= r else "Bearish"
+            conf = round(max(b, r) / len(grp), 2)
+            top_signals.append({"ticker": ticker, "signal": dominant,
+                                 "confidence": conf, "count": len(grp)})
+        top_signals = sorted(top_signals, key=lambda x: -x["count"])[:8]
+
+    avg_ret = None
+    for col in ("return_24h", "price_return_24h"):
+        if col in df.columns:
+            avg_ret = round(float(df[col].mean()), 4)
+            break
+
+    return JSONResponse(content=clean({
+        "total":        len(df),
+        "raw_news":     len(raw),
+        "bullish":      bull,
+        "bearish":      bear,
+        "neutral":      neut,
+        "avg_return":   avg_ret,
+        "model_loaded": MODEL_PKL.exists(),
+        "top_signals":  top_signals,
+    }))
+
+# ── GET /company/{ticker} ─────────────────────────────────────────────────────
 @app.get("/company/{ticker}")
 def get_company(ticker: str):
     ticker = ticker.upper()
-    df = load_labeled()
-    if df.empty:
-        raise HTTPException(status_code=404, detail="No data available")
-
-    if "ticker" not in df.columns:
-        raise HTTPException(status_code=404, detail="ticker column not found in dataset")
+    df = get_df()
+    if df.empty or "ticker" not in df.columns:
+        raise HTTPException(404, "No data")
 
     sub = df[df["ticker"].str.upper() == ticker]
     if sub.empty:
-        raise HTTPException(status_code=404, detail=f"No data for {ticker}")
+        raise HTTPException(404, f"No data for {ticker}")
 
-    if "signal" not in sub.columns and "impact_probability" in sub.columns:
-        sub = sub.copy()
-        sub["signal"] = sub["impact_probability"].apply(
-            lambda p: "Bullish" if p > 0.65 else ("Bearish" if p < 0.35 else "Neutral")
-        )
+    bull = int((sub["signal"] == "Bullish").sum())
+    bear = int((sub["signal"] == "Bearish").sum())
+    neut = int((sub["signal"] == "Neutral").sum())
 
-    stats = {
-        "ticker":        ticker,
-        "total_articles": int(len(sub)),
-        "avg_sentiment":  round(float(sub["sentiment_score"].mean()), 4) if "sentiment_score" in sub.columns else None,
-        "avg_return_24h": round(float(sub["price_return_24h"].mean()), 4) if "price_return_24h" in sub.columns else
-                          round(float(sub["return_24h"].mean()), 4) if "return_24h" in sub.columns else None,
-        "move_rate":      round(float(sub["label"].mean()), 4) if "label" in sub.columns else None,
-        "bullish_count":  int((sub["signal"] == "Bullish").sum()) if "signal" in sub.columns else 0,
-        "bearish_count":  int((sub["signal"] == "Bearish").sum()) if "signal" in sub.columns else 0,
-        "neutral_count":  int((sub["signal"] == "Neutral").sum()) if "signal" in sub.columns else 0,
-    }
+    avg_ret = None
+    for col in ("return_24h","price_return_24h"):
+        if col in sub.columns:
+            avg_ret = round(float(sub[col].mean()), 4)
+            break
 
-    recent = sub.where(pd.notnull(sub), None).head(10).to_dict(orient="records")
+    recent = sub.sort_values("published_at", ascending=False).head(10) \
+               if "published_at" in sub.columns else sub.head(10)
 
-    return {"ticker": ticker, "stats": stats, "recent": recent}
-
-
-# ── GET /summary — dashboard overview ────────────────────────────────────────
-@app.get("/summary")
-def get_summary():
-    df = load_labeled()
-    raw = load_raw_news()
-
-    if df.empty:
-        return {
-            "total_articles": 0,
-            "total_signals":  len(raw),
-            "bullish":        0,
-            "bearish":        0,
-            "neutral":        0,
-            "top_tickers":    [],
-            "model_loaded":   MODEL_PKL.exists(),
-        }
-
-    if "signal" not in df.columns and "impact_probability" in df.columns:
-        df["signal"] = df["impact_probability"].apply(
-            lambda p: "Bullish" if p > 0.65 else ("Bearish" if p < 0.35 else "Neutral")
-        )
-    elif "signal" not in df.columns and "label" in df.columns:
-        df["signal"] = df["label"].apply(lambda x: "Bullish" if x == 1 else "Neutral")
-
-    top_tickers = []
-    if "ticker" in df.columns:
-        top = (
-            df.groupby("ticker")
-            .agg(count=("ticker", "count"))
-            .sort_values("count", ascending=False)
-            .head(8)
-            .reset_index()
-        )
-        top_tickers = top.to_dict(orient="records")
-
-    return {
-        "total_articles": len(df),
-        "total_raw_news": len(raw),
-        "bullish":        int((df["signal"] == "Bullish").sum()) if "signal" in df.columns else 0,
-        "bearish":        int((df["signal"] == "Bearish").sum()) if "signal" in df.columns else 0,
-        "neutral":        int((df["signal"] == "Neutral").sum()) if "signal" in df.columns else 0,
-        "avg_return_24h": round(float(df["price_return_24h"].mean()), 4)
-                          if "price_return_24h" in df.columns else
-                          round(float(df["return_24h"].mean()), 4)
-                          if "return_24h" in df.columns else None,
-        "top_tickers":    top_tickers,
-        "model_loaded":   MODEL_PKL.exists(),
-    }
-
+    return JSONResponse(content=clean({
+        "ticker":   ticker,
+        "stats": {
+            "total":    len(sub),
+            "bullish":  bull,
+            "bearish":  bear,
+            "neutral":  neut,
+            "avg_return_24h": avg_ret,
+            "move_rate": round(float(sub["label"].mean()), 3) if "label" in sub.columns else None,
+        },
+        "recent": recent.where(pd.notnull(recent), None).to_dict(orient="records"),
+    }))
 
 # ── GET /model/info ───────────────────────────────────────────────────────────
 @app.get("/model/info")
 def model_info():
-    model = load_model()
+    model = get_model()
     if model is None:
-        return {"status": "not_found", "message": "Run: python src/models/impact_model.py"}
+        return {"status": "not_found"}
+    meta = joblib.load(META_PKL) if META_PKL.exists() else {}
+    return {"status": "loaded", "type": type(model).__name__, **meta}
 
-    info = {
-        "status":       "loaded",
-        "model_type":   type(model).__name__,
-        "model_path":   str(MODEL_PKL),
-    }
-
-    # XGBoost exposes feature importances
-    if hasattr(model, "feature_importances_"):
-        fi = {f"feature_{i}": round(float(v), 4)
-              for i, v in enumerate(model.feature_importances_)}
-        info["feature_importances"] = fi
-
-    df = load_labeled()
-    if not df.empty and "label" in df.columns:
-        info["training_samples"] = len(df)
-        info["positive_rate"]    = round(float(df["label"].mean()), 4)
+# ── POST /refresh — reload cache ──────────────────────────────────────────────
+@app.post("/refresh")
+def refresh():
+    invalidate_cache()
+    return {"status": "cache cleared"}
