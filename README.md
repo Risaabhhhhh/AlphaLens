@@ -1,98 +1,222 @@
-# AlphaLens — Phase 9 + 10
+📊 AlphaLens — Financial News Intelligence Platform
 
-FastAPI backend + React dashboard wired to YOUR existing CSV files and model.
+AlphaLens is an AI-powered platform that analyzes financial news in real time and predicts potential stock market impact using NLP and Machine Learning.
 
-## Your repo structure this targets
+The system ingests financial news, extracts companies and events, performs sentiment analysis using FinBERT, and predicts whether the news will cause a significant stock move using an XGBoost model.
 
-```
-AlphaLens/
-├── data/
-│   ├── models/impact_model.pkl       ← your trained model
-│   ├── processed/
-│   │   ├── labeled_dataset.csv       ← used by /signals
-│   │   └── news_features.csv         ← used by /news features
-│   └── raw/
-│       └── news_*.json               ← used by /news
-├── src/
-│   ├── api/main.py                   ← REPLACE with this
-│   ├── preprocessing/entity_extractor.py
-│   └── models/sentiment_model.py
-└── frontend/                         ← ADD this entire folder
-```
+The platform provides signals through a FastAPI backend and visualizes them in a React dashboard.
 
-## Integration Steps
+🚀 Features
+📰 News Intelligence
 
-### 1. Replace your API
-```bash
-# From your AlphaLens/ root
-cp path/to/new/src/api/main.py  src/api/main.py
-```
+Fetches live financial news via Finnhub API
 
-### 2. Add the frontend
-```bash
-# Copy the entire frontend/ folder into your repo
-cp -r path/to/new/frontend/  ./frontend/
-```
+Identifies companies mentioned in headlines using spaCy NER
 
-### 3. Update docker-compose.yml
-```bash
-cp path/to/new/docker-compose.yml  ./docker-compose.yml
-```
+Extracts event types (earnings, acquisition, regulatory, macro)
 
-### 4. Launch
-```bash
+🤖 NLP Sentiment Analysis
+
+Uses FinBERT for financial sentiment classification
+
+Outputs:
+
+Positive
+
+Neutral
+
+Negative
+
+Confidence score
+
+📈 Market Impact Prediction
+
+Trains an XGBoost classifier to predict if a stock will move significantly after news.
+
+Features include:
+
+Sentiment score
+
+Event type
+
+Source credibility
+
+Headline length
+
+Sentiment-event interaction
+
+⚡ Signal Generation
+
+Each news article is converted into a trading signal:
+
+Bullish
+Bearish
+Neutral
+
+with model confidence.
+
+📊 Interactive Dashboard
+
+React dashboard displaying:
+
+Market sentiment distribution
+
+Top signals
+
+Active tickers
+
+Raw news feed
+
+Signal filtering by ticker or sentiment
+
+🏗️ System Architecture
+Financial News
+      │
+      ▼
+Finnhub API
+      │
+      ▼
+Data Ingestion Pipeline
+      │
+      ▼
+spaCy NER + Event Detection
+      │
+      ▼
+FinBERT Sentiment Analysis
+      │
+      ▼
+Feature Engineering
+      │
+      ▼
+XGBoost Impact Model
+      │
+      ▼
+Signal Generator
+      │
+      ▼
+FastAPI Backend
+      │
+      ▼
+React Dashboard
+🧠 Machine Learning Pipeline
+NLP
+
+FinBERT — financial sentiment analysis
+
+spaCy — company entity recognition
+
+Model
+
+XGBoost Classifier
+
+Target variable:
+
+Did stock move > 2% within 24 hours of the news?
+
+Output:
+
+Probability of market impact
+📂 Project Structure
+AlphaLens
+│
+├── src
+│   ├── ingestion        # news collection
+│   ├── preprocessing    # text cleaning + NER
+│   ├── features         # dataset building
+│   ├── models           # ML models
+│   ├── signals          # signal generator
+│   └── api              # FastAPI backend
+│
+├── frontend             # React dashboard
+├── data                 # datasets
+├── config               # configuration files
+├── scripts              # helper scripts
+│
+├── bulk_collect.py      # large scale dataset builder
+├── docker-compose.yml
+├── Dockerfile.api
+└── requirements.txt
+⚙️ Installation
+1️⃣ Clone the repo
+git clone https://github.com/YOUR_USERNAME/AlphaLens.git
+cd AlphaLens
+2️⃣ Create environment
+python -m venv venv
+source venv/bin/activate
+
+Windows:
+
+venv\Scripts\activate
+3️⃣ Install dependencies
+pip install -r requirements.txt
+4️⃣ Install NLP models
+python -m spacy download en_core_web_sm
+🔑 Environment Variables
+
+Create .env
+
+FINNHUB_API_KEY=your_api_key_here
+
+Get API key:
+
+https://finnhub.io
+
+▶️ Run the Backend
+uvicorn src.api.main:app --reload
+
+Backend runs at:
+
+http://localhost:8000
+💻 Run the Frontend
+cd frontend
+npm install
+npm start
+
+Dashboard runs at:
+
+http://localhost:3000
+📊 Example Output
+
+Example signal:
+
+Headline:
+"Nvidia launches next generation AI chip"
+
+Sentiment:
+Positive
+
+Predicted Impact:
+0.71
+
+Signal:
+Bullish
+🐳 Docker Deployment
 docker-compose up --build
-```
 
-Open:
-- Dashboard → http://localhost:3000
-- API docs  → http://localhost:8000/docs
-- Health    → http://localhost:8000/health
+Runs:
 
-## API Endpoints
+FastAPI backend
+React frontend
+📈 Future Improvements
 
-| Method | Endpoint         | Description                            |
-|--------|-----------------|----------------------------------------|
-| GET    | /health          | Status + file checks                   |
-| POST   | /predict         | Single headline → signal               |
-| GET    | /signals         | All signals from labeled_dataset.csv   |
-| GET    | /signals?ticker=NVDA | Filter by ticker                   |
-| GET    | /signals?signal=Bullish | Filter by signal type           |
-| GET    | /news            | Raw news from JSON files               |
-| GET    | /company/{TICKER} | Per-ticker breakdown + stats          |
-| GET    | /summary         | Dashboard overview stats               |
-| GET    | /model/info      | Model metadata + feature importance    |
+Real-time streaming pipeline
 
-## POST /predict example
+Portfolio tracking
 
-```bash
-curl -X POST http://localhost:8000/predict \
-  -H "Content-Type: application/json" \
-  -d '{"headline": "Nvidia announces new AI chip", "ticker": "NVDA"}'
-```
+Market backtesting engine
 
-Response:
-```json
-{
-  "headline": "Nvidia announces new AI chip",
-  "ticker": "NVDA",
-  "sentiment": "positive",
-  "sentiment_score": 0.82,
-  "event_type": "product_launch",
-  "impact_probability": 0.71,
-  "signal": "Bullish",
-  "confidence": 0.42
-}
-```
+Reinforcement learning signal optimization
 
-## Dashboard Features
+Mobile dashboard
 
-- Live signal feed from your labeled_dataset.csv
-- Filter by Bullish / Bearish / Neutral
-- Filter by ticker (AAPL, NVDA, MSFT...)
-- Signal distribution pie chart
-- Top tickers bar chart
-- Model status panel
-- ⚡ Live PREDICT button — type any headline → instant signal
-- Raw news tab from your JSON files
-- Auto-refreshes every 30 seconds
+👨‍💻 Author
+
+Built by:
+
+Rishabh
+
+Full Stack Developer | ML Engineer
+
+⭐ If you like this project
+
+Give the repo a ⭐ on GitHub.
