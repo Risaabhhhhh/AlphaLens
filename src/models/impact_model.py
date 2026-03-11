@@ -11,6 +11,63 @@ INPUT_FILE = "data/processed/labeled_dataset.csv"
 MODEL_PATH = "data/models/impact_model.pkl"
 
 
+# -----------------------------
+# Load trained model
+# -----------------------------
+def load_model():
+
+    if not os.path.exists(MODEL_PATH):
+        raise Exception("Model not trained yet.")
+
+    return joblib.load(MODEL_PATH)
+
+
+# -----------------------------
+# Predict impact probability
+# -----------------------------
+def predict_impact(row: dict):
+
+    model = load_model()
+
+    df = pd.DataFrame([row])
+
+    # encode categorical fields (same logic as training)
+    sentiment_map = {
+        "negative": 0,
+        "neutral": 1,
+        "positive": 2
+    }
+
+    event_map = {
+        "earnings": 0,
+        "acquisition": 1,
+        "product_launch": 2,
+        "partnership": 3,
+        "lawsuit": 4,
+        "macro": 5,
+        "general": 6
+    }
+
+    df["sentiment_encoded"] = df["sentiment"].map(sentiment_map)
+    df["event_encoded"] = df["event_type"].map(event_map)
+
+    features = [
+        "sentiment_encoded",
+        "confidence",
+        "importance",
+        "event_encoded"
+    ]
+
+    X = df[features]
+
+    probability = model.predict_proba(X)[0][1]
+
+    return float(probability)
+
+
+# -----------------------------
+# Train model
+# -----------------------------
 def train_model():
 
     print("Loading dataset...")
@@ -27,7 +84,6 @@ def train_model():
     df["sentiment_encoded"] = sentiment_encoder.fit_transform(df["sentiment"])
     df["event_encoded"] = event_encoder.fit_transform(df["event_type"])
 
-    # feature columns
     features = [
         "sentiment_encoded",
         "confidence",
