@@ -139,7 +139,17 @@ def get_df() -> pd.DataFrame:
             return pd.DataFrame()
         df = pd.read_csv(LABELED_CSV)
         df.columns = [c.strip().lower() for c in df.columns]
-        # Unified sentiment
+
+        # ── 1. Unified ticker column ──────────────────────────────────────────
+        # CSV may store ticker in "ticker", "symbol", or "related" columns
+        for col in ("ticker", "symbol", "related"):
+            if col in df.columns:
+                df["ticker"] = df[col].fillna("").astype(str).str.strip()
+                break
+        if "ticker" not in df.columns:
+            df["ticker"] = ""
+
+        # ── 2. Unified sentiment ──────────────────────────────────────────────
         if "sentiment" in df.columns and "av_sentiment" in df.columns:
             df["_sentiment"] = df["sentiment"].combine_first(df["av_sentiment"])
         elif "sentiment" in df.columns:
@@ -148,14 +158,75 @@ def get_df() -> pd.DataFrame:
             df["_sentiment"] = df["av_sentiment"]
         else:
             df["_sentiment"] = "neutral"
-        # Signal
+        df["_sentiment"] = df["_sentiment"].fillna("neutral").astype(str).str.strip()
+
+        # ── 3. Confidence / score ─────────────────────────────────────────────
+        for col in ("av_score", "confidence", "score"):
+            if col in df.columns:
+                df["confidence"] = pd.to_numeric(df[col], errors="coerce").fillna(0.5)
+                break
+        if "confidence" not in df.columns:
+            df["confidence"] = 0.5
+
+        # ── 4. Return column normalisation ────────────────────────────────────
+        for col in ("return_24h", "price_return_24h", "return"):
+            if col in df.columns:
+                df["return_24h"] = pd.to_numeric(df[col], errors="coerce")
+                break
+
+        # ── 5. Signal generation ──────────────────────────────────────────────
+        # Strategy: use av_sentiment / sentiment string directly mapped to signal.
+        # Fall back to label + return if sentiment not available.
+        BULL_SENT = {"positive", "bullish", "somewhat-bullish", "buy"}
+        BEAR_SENT = {"negative", "bearish", "somewhat-bearish", "sell"}
+
+        def derive_signal(row):
+            # Priority 1: direct av_sentiment string (Alpha Vantage values)
+            sent = str(row.get("_sentiment", "")).lower().strip()
+            if sent in BULL_SENT:
+                return "Bullish"
+            if sent in BEAR_SENT:
+                return "Bearish"
+
+            # Priority 2: confidence + label
+            label = row.get("label", None)
+            conf  = float(row.get("confidence", 0.5) or 0.5)
+            ret   = row.get("return_24h", None)
+
+            if label == 1:
+                if conf >= 0.60:
+                    return "Bullish"
+                return "Neutral"
+            if label == 0:
+                if conf >= 0.60 and ret is not None and ret < -0.01:
+                    return "Bearish"
+                return "Neutral"
+
+            # Priority 3: return alone
+            if ret is not None:
+                if ret > 0.01:  return "Bullish"
+                if ret < -0.01: return "Bearish"
+
+            return "Neutral"
+
         if "signal" not in df.columns:
-            if "return_24h" in df.columns:
-                df["signal"] = df.apply(lambda r: "Bullish" if r.get("label",0)==1
-                    and str(r.get("_sentiment","")).lower() in ("positive","bullish","somewhat-bullish")
-                    else ("Bearish" if r.get("label",0)==1 else "Neutral"), axis=1)
-            else:
-                df["signal"] = "Neutral"
+            df["signal"] = df.apply(derive_signal, axis=1)
+        else:
+            # Validate existing signal values
+            valid = {"Bullish", "Bearish", "Neutral"}
+            mask  = ~df["signal"].isin(valid)
+            if mask.any():
+                df.loc[mask, "signal"] = df[mask].apply(derive_signal, axis=1)
+
+        # ── 6. Headline fallback ──────────────────────────────────────────────
+        if "headline" not in df.columns:
+            for col in ("title", "summary", "text"):
+                if col in df.columns:
+                    df["headline"] = df[col].fillna("").astype(str).str[:200]
+                    break
+        if "headline" not in df.columns:
+            df["headline"] = ""
+
         _cache["df"] = df
     return _cache["df"]
 
@@ -232,6 +303,30 @@ def health():
         "labeled_data": LABELED_CSV.exists(),
         "raw_files":    len(list(RAW_DIR.glob("*.json"))) if RAW_DIR.exists() else 0,
     }
+
+@app.get("/debug/csv")
+def debug_csv():
+    """Inspect what's actually in your labeled_dataset.csv — use this to diagnose empty signals."""
+    df = get_df()
+    if df.empty:
+        return {"error": "CSV not found or empty", "path": str(LABELED_CSV)}
+
+    tickers  = df["ticker"].dropna().unique().tolist() if "ticker" in df.columns else []
+    signals  = df["signal"].value_counts().to_dict() if "signal" in df.columns else {}
+    sentiments = df["_sentiment"].value_counts().to_dict() if "_sentiment" in df.columns else {}
+    columns  = df.columns.tolist()
+    sample   = clean(df.head(3).where(pd.notnull(df), None).to_dict(orient="records"))
+
+    return JSONResponse(content=clean({
+        "total_rows":      len(df),
+        "columns":         columns,
+        "tickers_found":   tickers[:50],
+        "ticker_count":    len(tickers),
+        "signal_counts":   signals,
+        "sentiment_counts":sentiments,
+        "sample_rows":     sample,
+        "csv_path":        str(LABELED_CSV),
+    }))
 
 # ── POST /analyze — headline analyzer ────────────────────────────────────────
 class AnalyzeRequest(BaseModel):
